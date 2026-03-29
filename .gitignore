@@ -1,0 +1,20 @@
+# 敏感文件
+credentials.json
+gmail_token.pickle
+
+# 历史数据
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
