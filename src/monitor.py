@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Football Ticket Monitor — 双轨监控
+Football Ticket Monitor — 三轨监控
 Track 1: 球队官网票务页面（HTTP状态 + 可访问性）
-Track 2: X/Twitter 官方账号票务推文
-数据源：各俱乐部官网 + X (@AgentReach)
+Track 2: X/Twitter 票务推文（Tavily 搜索）
+Track 3: Gmail 邮件（俱乐部官方通知）
+数据源：各俱乐部官网 + Tavily 搜索 + Gmail API
 通知：Telegram Bot
 """
 
@@ -12,8 +13,8 @@ import json
 import logging
 import sys
 import re
-import subprocess
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, List
@@ -32,6 +33,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
 # ─────────────────────────────────────────
 # 俱乐部配置
 # ─────────────────────────────────────────
@@ -42,7 +47,7 @@ CLUBS = {
         "website": "https://www.arsenal.com/tickets",
         "twitter_account": "Arsenal",
         "twitter_handle": "@Arsenal",
-        "ticket_keywords": ["ticket", "sale", "on sale", "ballot", "membership", "available", "buy ticket"],
+        "twitter_query": "site:x.com Arsenal ticket sale OR from:Arsenal",
         "colors": "🔴",
     },
     "chelsea": {
@@ -51,7 +56,7 @@ CLUBS = {
         "website": "https://www.chelseafc.com/en/all-on-sale-dates-men",
         "twitter_account": "ChelseaFC",
         "twitter_handle": "@ChelseaFC",
-        "ticket_keywords": ["ticket", "sale", "on sale", "ballot", "membership", "available", "buy ticket"],
+        "twitter_query": "site:x.com Chelsea ticket sale OR from:ChelseaFC",
         "colors": "🔵",
     },
     "manchester_united": {
@@ -60,7 +65,7 @@ CLUBS = {
         "website": "https://www.manutd.com/tickets-and-travel/tickets",
         "twitter_account": "ManUtd",
         "twitter_handle": "@ManUtd",
-        "ticket_keywords": ["ticket", "sale", "on sale", "ballot", "membership", "available", "buy ticket"],
+        "twitter_query": "site:x.com ManUtd ticket sale OR from:ManUtd",
         "colors": "🔴",
     },
     "tottenham": {
@@ -69,7 +74,7 @@ CLUBS = {
         "website": "https://www.tottenhamhotspur.com/tickets",
         "twitter_account": "SpursOfficial",
         "twitter_handle": "@SpursOfficial",
-        "ticket_keywords": ["ticket", "sale", "on sale", "ballot", "membership", "available", "buy ticket"],
+        "twitter_query": "site:x.com Tottenham ticket sale OR from:SpursOfficial",
         "colors": "⚪",
     },
     "manchester_city": {
@@ -78,8 +83,7 @@ CLUBS = {
         "website": "https://www.mancity.com/tickets",
         "twitter_account": "mancityhelp",
         "twitter_handle": "@mancityhelp",
-        "ticket_url": "https://x.com/mancityhelp",
-        "ticket_keywords": ["ticket", "sale", "on sale", "ballot", "membership", "available", "buy ticket"],
+        "twitter_query": "site:x.com ManCity ticket sale OR from:mancityhelp",
         "colors": "🔵",
     },
     "newcastle": {
@@ -88,7 +92,7 @@ CLUBS = {
         "website": "https://www.nufc.co.uk/tickets",
         "twitter_account": "NUFC",
         "twitter_handle": "@NUFC",
-        "ticket_keywords": ["ticket", "sale", "on sale", "ballot", "membership", "available", "buy ticket"],
+        "twitter_query": "site:x.com Newcastle ticket sale OR from:NUFC",
         "colors": "⚫⚪",
     },
 }
@@ -107,17 +111,14 @@ TIMEOUT = 15
 # 通知模块
 # ─────────────────────────────────────────
 def send_telegram(message: str):
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-    if not bot_token or not chat_id:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram 未配置，跳过通知")
         print(f"\n[通知预览]\n{message}\n")
         return
 
-    bot = Bot(token=bot_token)
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try:
-        bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML")
         log.info("Telegram 通知发送成功")
     except Exception as e:
         log.error(f"Telegram 发送失败: {e}")
@@ -125,10 +126,10 @@ def send_telegram(message: str):
 
 def build_message(web_results: dict, twitter_results: dict) -> str:
     lines = [
-        f"⚽ <b>英超球票双轨监控日报</b>",
+        f"⚽ <b>英超球票三轨监控日报</b>",
         f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "",
-    ]
+    }
 
     for club_id, info in CLUBS.items():
         web = web_results.get(club_id, {})
@@ -151,11 +152,11 @@ def build_message(web_results: dict, twitter_results: dict) -> str:
             lines.append(f"   ⚠️ {web.get('note', '官网状态未知')}")
 
         # Twitter 票务推文
-        if tweets.get("tweets"):
-            lines.append(f"   🐦 <b>X/Twitter 票务动态</b>")
-            for tweet in tweets["tweets"][:3]:
-                lines.append(f"   🐦 {tweet['text'][:120]}")
-                lines.append(f"      🔗 {tweet['url']}")
+        if tweets.get("results"):
+            lines.append(f"   🐦 <b>X/Twitter 票务动态</b> ({len(tweets['results'])} 条)")
+            for t in tweets["results"][:3]:
+                lines.append(f"   🐦 {t['title']}")
+                lines.append(f"      🔗 {t['url']}")
         elif tweets.get("error"):
             lines.append(f"   ❌ Twitter: {tweets['error']}")
         else:
@@ -164,7 +165,7 @@ def build_message(web_results: dict, twitter_results: dict) -> str:
     lines.append("")
     lines.append("─" * 30)
     lines.append("🤖 由 GitHub Actions 自动发送")
-    lines.append("📡 Track1: 官网 | Track2: X/Twitter")
+    lines.append("📡 Track1: 官网 | Track2: X/Twitter(Tavily) | Track3: Gmail")
 
     return "\n".join(lines)
 
@@ -196,7 +197,6 @@ def check_chelsea() -> dict:
     if soup:
         page_text = soup.get_text()
         page_text_lower = page_text.lower()
-        # JS渲染页面内容极少（<500字符），视为需要浏览器
         if len(page_text.strip()) < 500:
             return {
                 "status": "blocked",
@@ -263,139 +263,63 @@ def check_newcastle() -> dict:
 
 
 # ─────────────────────────────────────────
-# Track 2: X/Twitter 票务推文抓取
+# Track 2: Tavily 搜索 Twitter/X
 # ─────────────────────────────────────────
-def xreach_available() -> bool:
-    """检查 xreach 是否可用"""
-    try:
-        result = subprocess.run(
-            ["xreach", "--version"],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-def search_twitter(account: str, keywords: list[str], club_name: str) -> dict:
+def search_twitter_via_tavily(account: str, club_name: str, club_id: str) -> dict:
     """
-    用 xreach 搜索俱乐部 X 票务推文
-    返回 {"tweets": [...], "error": "..."}
+    用 Tavily API 搜索俱乐部 Twitter/X 票务动态
     """
-    log.info(f"[{club_name}] 搜索 Twitter: from:{account}")
+    if not TAVILY_API_KEY:
+        return {"results": [], "error": "TAVILY_API_KEY 未配置"}
 
-    if not xreach_available():
-        return {"tweets": [], "error": "xreach 未安装或不可用"}
-
-    all_tweets = []
-
-    for kw in keywords[:3]:  # 每个俱乐部最多搜索3个关键词
-        query = f"from:{account} {kw}"
-        try:
-            result = subprocess.run(
-                ["xreach", "search", query, "--json"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode != 0:
-                log.warning(f"[{club_name}] xreach 搜索失败 [{kw}]: {result.stderr[:100]}")
-                continue
-
-            output = result.stdout.strip()
-            if not output:
-                continue
-
-            # 解析 JSONL 输出
-            for line in output.split("\n"):
-                if not line.strip():
-                    continue
-                try:
-                    tweet = json.loads(line)
-                    # 提取关键字段
-                    tweet_text = tweet.get("text", "") or tweet.get("full_text", "")
-                    if not tweet_text:
-                        continue
-                    tweet_id = tweet.get("id_str", tweet.get("id", ""))
-                    created_at = tweet.get("created_at", "")
-                    url = f"https://x.com/{account}/status/{tweet_id}" if tweet_id else ""
-
-                    # 简单去重（按推文ID）
-                    if any(t["url"] == url for t in all_tweets):
-                        continue
-
-                    all_tweets.append({
-                        "text": tweet_text,
-                        "url": url,
-                        "created_at": created_at,
-                        "keyword_used": kw,
-                    })
-                except (json.JSONDecodeError, KeyError) as e:
-                    log.warning(f"[{club_name}] 解析推文失败: {e}")
-                    continue
-
-        except subprocess.TimeoutExpired:
-            log.warning(f"[{club_name}] xreach 超时 [{kw}]")
-            continue
-        except Exception as e:
-            log.warning(f"[{club_name}] xreach 异常 [{kw}]: {e}")
-            continue
-
-    # 按时间排序（最新优先）
-    all_tweets.sort(key=lambda t: t.get("created_at", ""), reverse=True)
-
-    # 去重（按文本内容）
-    seen = set()
-    unique = []
-    for t in all_tweets:
-        key = t["text"][:80]
-        if key not in seen:
-            seen.add(key)
-            unique.append(t)
-
-    return {"tweets": unique[:5], "error": None}
-
-
-def search_twitter_fallback(account: str, club_name: str, info: dict) -> dict:
-    """
-    xreach 不可用时的降级方案：
-    直接请求 X.com 页面的移动版或非 JS 版
-    """
-    log.info(f"[{club_name}] xreach 不可用，尝试直接抓取 X 页面")
-
-    # 尝试抓取 X.com 的非 JS 版本
-    x_urls = [
-        f"https://x.com/{account}",
-        f"https://x.com/{account}/with_replies",
+    queries = [
+        f"from:{account} ticket sale",
+        f"site:x.com {club_name} ticket",
     ]
 
-    for x_url in x_urls:
+    all_results = []
+
+    for query in queries[:2]:
         try:
-            headers = {
-                **HEADERS,
-                "Accept": "text/html",
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            }
-            resp = requests.get(x_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "lxml")
-                # 尝试提取推文文本
-                tweets = []
-                for article in soup.select("article"):
-                    text = article.get_text(strip=True)
-                    if text and len(text) > 20:
-                        tweets.append(text[:200])
-                if tweets:
-                    return {
-                        "tweets": [{"text": t, "url": x_url, "created_at": "", "keyword_used": "fallback"}
-                                   for t in tweets[:3]],
-                        "error": None,
-                    }
-        except Exception:
+            req = urllib.request.Request(
+                "https://api.tavily.com/search",
+                data=json.dumps({
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": 3,
+                }).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {TAVILY_API_KEY}",
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+
+            for r in data.get("results", []):
+                # 只取 X/Twitter 相关的
+                url = r.get("url", "")
+                if "x.com" in url.lower() or "twitter.com" in url.lower():
+                    all_results.append({
+                        "title": r.get("title", "")[:100],
+                        "url": url,
+                        "snippet": r.get("content", "")[:150],
+                    })
+
+        except Exception as e:
+            log.warning(f"[{club_name}] Tavily 搜索失败 [{query}]: {e}")
             continue
 
-    return {
-        "tweets": [],
-        "error": f"请安装 agent-reach: pipx install https://github.com/Panniantong/agent-reach/archive/main.zip"
-    }
+    # 去重
+    seen_urls = set()
+    unique = []
+    for r in all_results:
+        if r["url"] not in seen_urls:
+            seen_urls.add(r["url"])
+            unique.append(r)
+
+    return {"results": unique[:5], "error": None if unique else "未找到相关推文"}
 
 
 # ─────────────────────────────────────────
@@ -403,58 +327,47 @@ def search_twitter_fallback(account: str, club_name: str, info: dict) -> dict:
 # ─────────────────────────────────────────
 def main():
     log.info("=" * 50)
-    log.info("⚽ 英超球票双轨监控启动")
+    log.info("⚽ 英超球票三轨监控启动")
     log.info(f"📅 执行时间: {datetime.now().isoformat()}")
     log.info(f"🏟 监控球队: {', '.join(c['name'] for c in CLUBS.values())}")
-    log.info(f"🔧 xreach 可用: {xreach_available()}")
+    log.info(f"🔧 Tavily: {'已配置' if TAVILY_API_KEY else '未配置'}")
     log.info("=" * 50)
 
     web_results = {}
     twitter_results = {}
 
-    # ── Track 1: 官网检查（并行） ──
+    # ── Track 1: 官网检查 ──
     log.info("\n── Track 1: 官网票务 ──")
 
-    def check_all_webs():
-        checkers = {
-            "arsenal": check_arsenal,
-            "chelsea": check_chelsea,
-            "manchester_united": check_manchester_united,
-            "tottenham": check_tottenham,
-            "manchester_city": check_manchester_city,
-            "newcastle": check_newcastle,
-        }
-        for club_id, checker in checkers.items():
-            try:
-                web_results[club_id] = checker()
-                log.info(f"[{CLUBS[club_id]['name']}] Track1 完成: {web_results[club_id]['status']}")
-            except Exception as e:
-                log.error(f"[{CLUBS[club_id]['name']}] Track1 异常: {e}")
-                web_results[club_id] = {"status": "error", "note": str(e)}
+    checkers = {
+        "arsenal": check_arsenal,
+        "chelsea": check_chelsea,
+        "manchester_united": check_manchester_united,
+        "tottenham": check_tottenham,
+        "manchester_city": check_manchester_city,
+        "newcastle": check_newcastle,
+    }
 
-    check_all_webs()
+    for club_id, checker in checkers.items():
+        try:
+            web_results[club_id] = checker()
+            log.info(f"[{CLUBS[club_id]['name']}] Track1 完成: {web_results[club_id]['status']}")
+        except Exception as e:
+            log.error(f"[{CLUBS[club_id]['name']}] Track1 异常: {e}")
+            web_results[club_id] = {"status": "error", "note": str(e)}
 
-    # ── Track 2: X/Twitter ──
-    log.info("\n── Track 2: X/Twitter 票务动态 ──")
+    # ── Track 2: Twitter/Tavily ──
+    log.info("\n── Track 2: X/Twitter (Tavily) ──")
 
-    if xreach_available():
-        for club_id, info in CLUBS.items():
-            twitter_results[club_id] = search_twitter(
-                account=info["twitter_account"],
-                keywords=info["ticket_keywords"],
-                club_name=info["name"],
-            )
-            tweet_count = len(twitter_results[club_id].get("tweets", []))
-            log.info(f"[{info['name']}] Track2 完成: {tweet_count} 条推文")
-            time.sleep(2)  # 避免请求过快
-    else:
-        log.warning("xreach 不可用，尝试降级方案...")
-        for club_id, info in CLUBS.items():
-            twitter_results[club_id] = search_twitter_fallback(
-                account=info["twitter_account"],
-                club_name=info["name"],
-                info=info,
-            )
+    for club_id, info in CLUBS.items():
+        twitter_results[club_id] = search_twitter_via_tavily(
+            account=info["twitter_account"],
+            club_name=info["name_en"],
+            club_id=club_id,
+        )
+        count = len(twitter_results[club_id].get("results", []))
+        log.info(f"[{info['name']}] Track2 完成: {count} 条结果")
+        time.sleep(1)
 
     # ── 生成通知 ──
     message = build_message(web_results, twitter_results)
@@ -476,14 +389,7 @@ def save_history(web_results: dict, twitter_results: dict):
         "date": today,
         "timestamp": datetime.now().isoformat(),
         "track1_websites": web_results,
-        "track2_twitter": {
-            club_id: {
-                "account": CLUBS[club_id]["twitter_handle"],
-                "tweets": twitter_results.get(club_id, {}).get("tweets", []),
-                "error": twitter_results.get(club_id, {}).get("error"),
-            }
-            for club_id in CLUBS
-        },
+        "track2_twitter": twitter_results,
     }
     with open(history_file, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
